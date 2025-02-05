@@ -173,7 +173,8 @@
   (for ([op (in-list (all-operators))])
     (define vars (map (lambda (_) (gensym)) (operator-info op 'itype)))
     (define disc (discretization 64 #f #f)) ; fake arguments
-    (rival-compile (list `(,op ,@vars)) vars (list disc))))
+    (parameterize ([*rival-profile-executions* 10000])
+    (rival-compile (list `(,op ,@vars)) vars (list disc)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Operator implementations

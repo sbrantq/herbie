@@ -63,7 +63,9 @@
   ; create the machine
   (define exprs (cons `(assert ,pre) specs))
   (define discs (cons boolean-discretization (map repr->discretization reprs)))
-  (define machine (rival-compile exprs vars discs))
+  (define machine
+    (parameterize ([*rival-profile-executions* 10000])
+    (rival-compile exprs vars discs)))
   (timeline-push! 'compiler
                   (apply + 1 (expr-size pre) (map expr-size specs))
                   (+ (length vars) (rival-profile machine 'instructions)))
