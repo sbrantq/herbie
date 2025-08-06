@@ -11,10 +11,10 @@
          rival)
 
 (require "../config.rkt"
-         "../syntax/types.rkt"
          "../utils/errors.rkt"
          "../utils/float.rkt"
-         "../utils/timeline.rkt")
+         "../utils/timeline.rkt"
+         "../syntax/types.rkt")
 
 (provide (struct-out real-compiler)
          (contract-out
@@ -24,7 +24,7 @@
                 (#:pre [pre any/c])
                 [c real-compiler?])]
           [real-apply
-           (->* (real-compiler? list?) ((or/c (vectorof any/c) boolean?)) (values symbol? any/c))]
+           (->* (real-compiler? vector?) ((or/c (vectorof any/c) boolean?)) (values symbol? any/c))]
           [real-compiler-clear! (-> real-compiler-clear! void?)]
           [real-compiler-analyze
            (->* (real-compiler? (vectorof ival?))
@@ -58,7 +58,6 @@
 ;; for each expression. Optionally, takes a precondition.
 (define (make-real-compiler specs ctxs #:pre [pre '(TRUE)])
   (define vars (context-vars (first ctxs)))
-  (define var-reprs (context-var-reprs (first ctxs)))
   (define reprs (map context-repr ctxs))
   ; create the machine
   (define exprs (cons `(assert ,pre) specs))
@@ -89,16 +88,22 @@
       [else #f]))
 
   ; wrap it with useful information for Herbie
-  (real-compiler pre vars var-reprs specs reprs machine dump-file))
+  (real-compiler pre
+                 (list->vector vars)
+                 (list->vector (context-var-reprs (first ctxs)))
+                 specs
+                 (list->vector reprs)
+                 machine
+                 dump-file))
 
 ;; Runs a Rival machine on an input point.
 (define (real-apply compiler pt [hint #f])
   (match-define (real-compiler _ vars var-reprs _ _ machine dump-file) compiler)
   (define start (current-inexact-milliseconds))
   (define pt*
-    (for/vector #:length (length vars)
-                ([val (in-list pt)]
-                 [repr (in-list var-reprs)])
+    (for/vector #:length (vector-length vars)
+                ([val (in-vector pt)]
+                 [repr (in-vector var-reprs)])
       ((representation-repr->bf repr) val)))
   (when dump-file
     (define args (map bigfloat->rational (vector->list pt*)))
@@ -114,8 +119,8 @@
   (when (> (rival-profile machine 'bumps) 0)
     (warn 'ground-truth
           "Could not converge on a ground truth"
-          #:extra (for/list ([var (in-list vars)]
-                             [val (in-list pt)])
+          #:extra (for/list ([var (in-vector vars)]
+                             [val (in-vector pt)])
                     (format "~a = ~a" var val))))
   (define executions (rival-profile machine 'executions))
   (when (>= (vector-length executions) (*rival-profile-executions*))
@@ -142,4 +147,4 @@
 ;; for the given inputs range. The result is an interval representing
 ;; how certain the result is: no, maybe, yes.
 (define (real-compiler-analyze compiler input-ranges [hint #f])
-  (rival-analyze (real-compiler-machine compiler) input-ranges hint))
+  (rival-analyze-with-hints (real-compiler-machine compiler) input-ranges hint))

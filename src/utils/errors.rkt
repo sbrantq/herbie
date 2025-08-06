@@ -48,10 +48,11 @@
 
 (define (syntax->error-format-string stx)
   (define file
-    (if (path? (syntax-source stx))
-        (let-values ([(base name dir?) (split-path (syntax-source stx))])
-          (path->string name))
-        (syntax-source stx)))
+    (cond
+      [(path? (syntax-source stx))
+       (define-values (base name dir?) (split-path (syntax-source stx)))
+       (path->string name)]
+      [else (syntax-source stx)]))
   (format "~a:~a:~a: ~~a"
           file
           (or (syntax-line stx) "")
@@ -62,7 +63,7 @@
   (for/list ([(name loc) (in-dict ctx)])
     (define name* (or name "(unnamed)"))
     (match loc
-      [(srcloc file line col _ _) (cons name* (list file line col))]
+      [(srcloc file line col _ _) (list name* file line col)]
       [#f (cons name* #f)])))
 
 (define (syntax-locations->datum exn)
@@ -126,6 +127,6 @@
     (define url* (and url (format "https://herbie.uwplse.org/doc/~a/~a" *herbie-version* url)))
     (when url*
       (eprintf "See <~a> for more.\n" url*))
-    (define entry (list type message args url* extra))
+    (define entry (list (~a type) (apply format message args) url* extra))
     (set-add! (warnings) type)
     (warning-log (cons entry (warning-log)))))

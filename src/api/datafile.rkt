@@ -2,7 +2,8 @@
 
 (require json
          racket/date)
-(require "../syntax/types.rkt"
+(require "../syntax/platform.rkt"
+         "../syntax/types.rkt"
          "../utils/common.rkt"
          "../utils/pareto.rkt")
 
@@ -17,7 +18,6 @@
         (name identifier
               status
               pre
-              preprocess
               precision
               conversions
               vars
@@ -29,16 +29,13 @@
               start
               result
               target
-              start-est
-              result-est
               time
               link
               cost-accuracy)
   #:prefab)
 
 (struct report-info (date commit branch seed flags points iterations tests merged-cost-accuracy)
-  #:prefab
-  #:mutable)
+  #:prefab)
 
 (define (make-report-info tests #:seed [seed #f])
   (report-info (current-date)
@@ -62,9 +59,9 @@
   (define initial-accuracy
     (let ([initial-accuracies-sum
            (for/sum ([cost-accuracy (in-list cost-accuracies)] #:unless (null? cost-accuracy))
-                    (match cost-accuracy
-                      [(list (list _ initial-accuracy) _ _) initial-accuracy]))])
-      (if (> maximum-accuracy 0)
+                    (match-define (list (list _ initial-accuracy) _ _) cost-accuracy)
+                    initial-accuracy)])
+      (if (positive? maximum-accuracy)
           (exact->inexact (- 1 (/ initial-accuracies-sum maximum-accuracy)))
           1.0)))
   (define rescaled
@@ -81,6 +78,8 @@
   (define frontier
     (map
      (match-lambda
+       [(list 0 accuracy)
+        (list "N/A" (- 1 (/ accuracy maximum-accuracy)))] ; in case if cost-model is 0
        ;; Equivalent to (/ 1 (/ cost tests-length))
        [(list cost accuracy) (list (/ 1 (/ cost tests-length)) (- 1 (/ accuracy maximum-accuracy)))])
      (pareto-combine rescaled #:convex? #t)))
@@ -88,67 +87,60 @@
     (argmax identity
             (cons 0.0 ;; To prevent `argmax` from signaling an error in case `tests` is empty
                   (map (match-lambda
+                         [(list "N/A" _) 1.0]
                          [(list cost _) cost])
                        frontier))))
   (list (list 1.0 initial-accuracy) frontier))
 
 (define (write-datafile file info)
   (define (simplify-test test)
-    (match test
-      [(table-row name
-                  identifier
-                  status
-                  pre
-                  preprocess
-                  prec
-                  conversions
-                  vars
-                  warnings
-                  input
-                  output
-                  spec
-                  target-prog
-                  start-bits
-                  end-bits
-                  target-bits
-                  start-est
-                  end-est
-                  time
-                  link
-                  cost-accuracy)
-       (define bits (representation-total-bits (get-representation prec)))
-       (define cost-accuracy*
-         (match cost-accuracy
-           [(list) (list)]
-           [(list start best others)
-            (list start
-                  best
-                  (for/list ([other (in-list others)])
-                    (match-define (list cost error expr) other)
-                    (list cost error (~a expr))))]))
-       (make-hash `((name . ,name) (identifier . ,(~s identifier))
-                                   (pre . ,(~s pre))
-                                   (preprocess . ,(~s preprocess))
-                                   (prec . ,(~s prec))
-                                   (bits . ,(representation-total-bits (get-representation prec)))
-                                   (conversions . ,(map (curry map ~s) conversions))
-                                   (status . ,status)
-                                   (start . ,start-bits)
-                                   (end . ,end-bits)
-                                   (target . ,target-bits)
-                                   (start-est . ,start-est)
-                                   (end-est . ,end-est)
-                                   (vars . ,(if vars
-                                                (map symbol->string vars)
-                                                #f))
-                                   (warnings . ,(map ~s warnings))
-                                   (input . ,(~s input))
-                                   (output . ,(~s output))
-                                   (spec . ,(~s spec))
-                                   (target-prog . ,(~s target-prog))
-                                   (time . ,time)
-                                   (link . ,(~a link))
-                                   (cost-accuracy . ,cost-accuracy*)))]))
+    (match-define (table-row name
+                             identifier
+                             status
+                             pre
+                             prec
+                             conversions
+                             vars
+                             warnings
+                             input
+                             output
+                             spec
+                             target-prog
+                             start-bits
+                             end-bits
+                             target-bits
+                             time
+                             link
+                             cost-accuracy)
+      test)
+    (define bits (representation-total-bits (get-representation prec)))
+    (define cost-accuracy*
+      (match cost-accuracy
+        [(list) (list)]
+        [(list start best others)
+         (list start
+               best
+               (for/list ([other (in-list others)])
+                 (match-define (list cost error expr) other)
+                 (list cost error (~a expr))))]))
+    (make-hash `((name . ,name) (identifier . ,(~s identifier))
+                                (pre . ,(~s pre))
+                                (prec . ,(~s prec))
+                                (bits . ,(representation-total-bits (get-representation prec)))
+                                (conversions . ,(map (curry map ~s) conversions))
+                                (status . ,status)
+                                (start . ,start-bits)
+                                (end . ,end-bits)
+                                (target . ,target-bits)
+                                (vars . ,(and vars (map symbol->string vars)))
+                                (warnings . ,warnings)
+                                (input . ,(~s input))
+                                (output . ,(~s output))
+                                (spec . ,(~s spec))
+                                (target-prog . ,(~s target-prog))
+                                (time . ,time)
+                                (link . ,(~a link))
+                                (cost-accuracy . ,cost-accuracy*))))
 
   (define data
     (match info
@@ -180,64 +172,57 @@
 
 (define (read-datafile port)
   (define (parse-string s)
-    (if s
-        (call-with-input-string s read)
-        #f))
+    (and s (call-with-input-string s read)))
 
-  (let* ([json (read-json port)]
-         [get (λ (field) (hash-ref json field))])
-    (report-info (seconds->date (get 'date))
-                 (get 'commit)
-                 (get 'branch)
-                 (parse-string (get 'seed))
-                 (list->flags (get 'flags))
-                 (get 'points)
-                 (get 'iterations)
-                 (for/list ([test (get 'tests)]
-                            #:when (hash-has-key? test 'vars))
-                   (let ([get (λ (field) (hash-ref test field))])
-                     (define vars
-                       (match (hash-ref test 'vars)
-                         [(list names ...) (map string->symbol names)]
-                         [string-lst (parse-string string-lst)]))
-                     (define cost-accuracy
-                       (match (hash-ref test 'cost-accuracy '())
-                         [(list) (list)]
-                         [(list start best others)
-                          (list start
-                                best
-                                (for/list ([other (in-list others)])
-                                  (match-define (list cost err expr) other)
-                                  (list cost err (parse-string expr))))]
-                         [(? string? s) (parse-string s)]))
-                     (table-row (get 'name)
-                                (parse-string (hash-ref test 'identifier "#f"))
-                                (get 'status)
-                                (parse-string (hash-ref test 'pre "TRUE"))
-                                (parse-string (hash-ref test 'preprocess "()"))
-                                (parse-string (hash-ref test 'prec "binary64"))
-                                (let ([cs (hash-ref test 'conversions "()")])
-                                  (if (string? cs)
-                                      (parse-string cs)
-                                      (map (curry map parse-string) cs)))
-                                vars
-                                (map string->symbol (hash-ref test 'warnings '()))
-                                (parse-string (get 'input))
-                                (parse-string (get 'output))
-                                (parse-string (hash-ref test 'spec "#f"))
-                                (parse-string (hash-ref test 'target-prog "#f"))
-                                (get 'start)
-                                (get 'end)
-                                (get 'target)
-                                (hash-ref test 'start-est 0)
-                                (hash-ref test 'end-est 0)
-                                (get 'time)
-                                (get 'link)
-                                cost-accuracy)))
-                 (hash-ref json 'merged-cost-accuracy null))))
-
-(define (unique? a)
-  (or (null? a) (andmap (curry equal? (car a)) (cdr a))))
+  (define json (read-json port))
+  (define (get field)
+    (hash-ref json field))
+  (report-info (seconds->date (get 'date))
+               (get 'commit)
+               (get 'branch)
+               (parse-string (get 'seed))
+               (list->flags (get 'flags))
+               (get 'points)
+               (get 'iterations)
+               (for/list ([test (get 'tests)]
+                          #:when (hash-has-key? test 'vars))
+                 (let ([get (λ (field) (hash-ref test field))])
+                   (define vars
+                     (match (hash-ref test 'vars)
+                       [(list names ...) (map string->symbol names)]
+                       [string-lst (parse-string string-lst)]))
+                   (define cost-accuracy
+                     (match (hash-ref test 'cost-accuracy '())
+                       [(list) (list)]
+                       [(list start best others)
+                        (list start
+                              best
+                              (for/list ([other (in-list others)])
+                                (match-define (list cost err expr) other)
+                                (list cost err (parse-string expr))))]
+                       [(? string? s) (parse-string s)]))
+                   (table-row (get 'name)
+                              (parse-string (hash-ref test 'identifier "#f"))
+                              (get 'status)
+                              (parse-string (hash-ref test 'pre "TRUE"))
+                              (parse-string (hash-ref test 'prec "binary64"))
+                              (let ([cs (hash-ref test 'conversions "()")])
+                                (if (string? cs)
+                                    (parse-string cs)
+                                    (map (curry map parse-string) cs)))
+                              vars
+                              (hash-ref test 'warnings '())
+                              (parse-string (get 'input))
+                              (parse-string (get 'output))
+                              (parse-string (hash-ref test 'spec "#f"))
+                              (parse-string (hash-ref test 'target-prog "#f"))
+                              (get 'start)
+                              (get 'end)
+                              (get 'target)
+                              (get 'time)
+                              (get 'link)
+                              cost-accuracy)))
+               (hash-ref json 'merged-cost-accuracy null)))
 
 (define (merge-datafiles dfs #:dirs [dirs #f])
   (when (null? dfs)
@@ -246,9 +231,9 @@
                           report-info-seed
                           report-info-flags
                           report-info-points
-                          report-info-iterations))])
-    (unless (unique? (map f dfs))
-      (error 'merge-datafiles "Cannot merge datafiles at different ~a" f)))
+                          report-info-iterations))]
+        #:unless (<= (set-count (list->set (map f dfs))) 1))
+    (error 'merge-datafiles "Cannot merge datafiles at different ~a" f))
   (unless dirs
     (set! dirs (map (const #f) dfs)))
   (define tests

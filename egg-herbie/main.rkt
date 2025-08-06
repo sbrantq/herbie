@@ -8,6 +8,7 @@
 (provide egraph_create
          egraph_destroy
          egraph_add_expr
+         egraph_add_root
          egraph_add_node
          egraph_run
          egraph_copy
@@ -171,13 +172,14 @@
 ;; egraph -> expr -> id
 (define-eggmath egraph_add_expr (_fun _egraph-pointer _rust/datum -> _uint))
 
+(define-eggmath egraph_add_root (_fun _egraph-pointer _uint -> _void))
+
 ; egraph -> string -> ids -> bool -> id
 (define-eggmath egraph_add_node
                 (_fun [p : _egraph-pointer] ; egraph
                       [f : _rust/string] ; enode op
                       [v : _u32vector] ; id vector
                       [_uint = (u32vector-length v)] ; id vector length
-                      [is_root : _stdbool] ; root node?
                       ->
                       _uint))
 
@@ -194,7 +196,6 @@
                       _uint ;; iter limit
                       _uint ;; node limit
                       _stdbool ;; simple scheduler?
-                      _stdbool ;; constant folding enabled?
                       ->
                       (iterations : _EGraphIter-pointer) ;; array of _EgraphIter structs
                       ->
@@ -208,8 +209,10 @@
                         (destroy_egraphiters iterations-ptr)
                         iter-data)))
 
+(define _stop_reason (_enum '(saturated iter-limit node-limit unsound) _uint))
+
 ;; gets the stop reason as an integer
-(define-eggmath egraph_get_stop_reason (_fun _egraph-pointer -> _uint))
+(define-eggmath egraph_get_stop_reason (_fun _egraph-pointer -> _stop_reason))
 
 ;; egraph -> string
 (define-eggmath egraph_serialize (_fun _egraph-pointer -> _rust/datum))

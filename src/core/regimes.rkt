@@ -1,24 +1,21 @@
 #lang racket
 
-(require "../utils/common.rkt"
-         "../utils/alternative.rkt"
-         "programs.rkt"
+(require "../utils/alternative.rkt"
+         "../utils/common.rkt"
+         "../utils/float.rkt"
          "../utils/timeline.rkt"
          "../syntax/types.rkt"
-         "../utils/errors.rkt"
+         "compiler.rkt"
          "points.rkt"
-         "../utils/float.rkt"
-         "compiler.rkt")
+         "programs.rkt")
 (provide pareto-regimes
          (struct-out option)
          (struct-out si))
 
 (module+ test
   (require rackunit
-           "../syntax/load-plugin.rkt"
            "../syntax/syntax.rkt"
-           "../syntax/sugar.rkt")
-  (load-herbie-builtins))
+           "../syntax/sugar.rkt"))
 
 (struct option (split-indices alts pts expr errors)
   #:transparent
@@ -26,12 +23,13 @@
   [(define (write-proc opt port mode)
      (fprintf port "#<option ~a>" (option-split-indices opt)))])
 
-(define (pareto-regimes sorted ctx)
-  (define err-lsts (batch-errors (map alt-expr sorted) (*pcontext*) ctx))
+(define (pareto-regimes sorted start-prog ctx pcontext)
+  (timeline-event! 'regimes)
+  (define err-lsts (batch-errors (map alt-expr sorted) pcontext ctx))
   (define branches
     (if (null? sorted)
         '()
-        (exprs-to-branch-on sorted ctx)))
+        (exprs-to-branch-on sorted start-prog ctx)))
   (define branch-exprs
     (if (flag-set? 'reduce 'branch-expressions)
         branches
@@ -42,17 +40,16 @@
     (cond
       [(null? alts) '()]
       ; Only return one option if not pareto mode
-      [(and (not (*pareto-mode*)) (not (equal? alts sorted))) '()]
       [else
-       (define-values (opt new-errs) (infer-splitpoints branch-exprs alts err-lsts #:errs errs ctx))
+       (define-values (opt new-errs)
+         (infer-splitpoints branch-exprs alts err-lsts #:errs errs ctx pcontext))
        (define high (si-cidx (argmax (λ (x) (si-cidx x)) (option-split-indices opt))))
        (cons opt (loop (take alts high) new-errs (take err-lsts high)))])))
 
 ;; `infer-splitpoints` and `combine-alts` are split so the mainloop
 ;; can insert a timeline break between them.
 
-(define (infer-splitpoints branch-exprs alts err-lsts* #:errs [cerrs (hash)] ctx)
-  (timeline-event! 'regimes)
+(define (infer-splitpoints branch-exprs alts err-lsts* #:errs [cerrs (hash)] ctx pcontext)
   (timeline-push! 'inputs (map (compose ~a alt-expr) alts))
   (define sorted-bexprs
     (sort branch-exprs (lambda (x y) (< (hash-ref cerrs x -1) (hash-ref cerrs y -1)))))
@@ -68,7 +65,7 @@
               ([bexpr sorted-bexprs]
                ;; stop if we've computed this (and following) branch-expr on more alts and it's still worse
                #:break (> (hash-ref cerrs bexpr -1) best-err))
-      (define opt (option-on-expr alts err-lsts bexpr ctx))
+      (define opt (option-on-expr alts err-lsts bexpr ctx pcontext))
       (define err
         (+ (errors-score (option-errors opt))
            (length (option-split-indices opt)))) ;; one-bit penalty per split
@@ -88,11 +85,11 @@
   (timeline-push! 'oracle (errors-score (map (curry apply max) err-lsts)))
   (values best errs))
 
-(define (exprs-to-branch-on alts ctx)
+(define (exprs-to-branch-on alts start-prog ctx)
   (define alt-critexprs
     (for/list ([alt (in-list alts)])
       (all-critical-subexpressions (alt-expr alt) ctx)))
-  (define start-critexprs (all-critical-subexpressions (*start-prog*) ctx))
+  (define start-critexprs (all-critical-subexpressions start-prog ctx))
   ;; We can only binary search if the branch expression is critical
   ;; for all of the alts and also for the start prgoram.
   (filter (λ (e) (equal? (representation-type (repr-of e ctx)) 'real))
@@ -103,7 +100,7 @@
   (define crit-vars (free-variables subexpr))
   (define replaced-expr (replace-expression expr subexpr 1))
   (define non-crit-vars (free-variables replaced-expr))
-  (and (not (null? crit-vars)) (set-disjoint? crit-vars non-crit-vars)))
+  (and (not (null? crit-vars)) (null? (set-intersect crit-vars non-crit-vars))))
 
 ;; Requires that prog is a λ expression
 (define (all-critical-subexpressions expr ctx)
@@ -114,16 +111,16 @@
              #:when (critical-subexpression? expr subexpr))
     subexpr))
 
-(define (option-on-expr alts err-lsts expr ctx)
+(define (option-on-expr alts err-lsts expr ctx pcontext)
   (define timeline-stop! (timeline-start! 'times (~a expr)))
 
   (define fn (compile-prog expr ctx))
   (define repr (repr-of expr ctx))
 
   (define big-table ; pt ; splitval ; alt1-err ; alt2-err ; ...
-    (for/list ([(pt ex) (in-pcontext (*pcontext*))]
+    (for/list ([(pt ex) (in-pcontext pcontext)]
                [err-lst err-lsts])
-      (list* (apply fn pt) pt err-lst)))
+      (list* (fn pt) pt err-lst)))
   (match-define (list splitvals* pts* err-lsts* ...)
     (flip-lists (sort big-table (curryr </total repr) #:key first)))
 
@@ -135,7 +132,7 @@
                      [prev splitvals*])
             (</total prev val repr))))
   (define split-indices (infer-split-indices bit-err-lsts* can-split?))
-  (define out (option split-indices alts pts* expr (pick-errors split-indices pts* err-lsts* repr)))
+  (define out (option split-indices alts pts* expr (pick-errors split-indices err-lsts* repr)))
   (timeline-stop!)
   (timeline-push! 'branch
                   (~a expr)
@@ -144,42 +141,36 @@
                   (~a (representation-name repr)))
   out)
 
-(define/contract (pick-errors split-indices pts err-lsts repr)
-  (->i ([sis (listof si?)] [vss (r) (listof (listof (representation-repr? r)))]
-                           [errss (listof (listof real?))]
-                           [r representation?])
-       [idxs (listof nonnegative-integer?)])
+(define/contract (pick-errors split-indices err-lsts repr)
+  (-> (listof si?) (listof (listof real?)) representation? (listof nonnegative-integer?))
   (for/list ([i (in-naturals)]
-             [pt pts]
-             [errs (flip-lists err-lsts)])
-    (for/first ([si split-indices]
-                #:when (< i (si-pidx si)))
-      (list-ref errs (si-cidx si)))))
+             [errs (in-list (flip-lists err-lsts))])
+    (list-ref errs (si-cidx (findf (lambda (x) (< i (si-pidx x))) split-indices)))))
 
 (module+ test
-  (define ctx (make-debug-context '(x)))
-  (parameterize ([*start-prog* (literal 1 'binary64)]
-                 [*pcontext* (mk-pcontext '((0.5) (4.0)) '(1.0 1.0))])
-    (define alts (map make-alt (list '(fmin.f64 x 1) '(fmax.f64 x 1))))
-    (define err-lsts `((,(expt 2.0 53) 1.0) (1.0 ,(expt 2.0 53))))
+  (require "../syntax/platform.rkt"
+           "../syntax/load-platform.rkt")
+  (activate-platform! "c")
+  (define ctx (context '(x) <binary64> (list <binary64>)))
+  (define pctx (mk-pcontext '(#(0.5) #(4.0)) '(1.0 1.0)))
+  (define alts (map make-alt (list '(fmin.f64 x 1) '(fmax.f64 x 1))))
+  (define err-lsts `((,(expt 2.0 53) 1.0) (1.0 ,(expt 2.0 53))))
 
-    (define (test-regimes expr goal)
-      (check (lambda (x y) (equal? (map si-cidx (option-split-indices x)) y))
-             (option-on-expr alts err-lsts expr ctx)
-             goal))
+  (define (test-regimes expr goal)
+    (check (lambda (x y) (equal? (map si-cidx (option-split-indices x)) y))
+           (option-on-expr alts err-lsts expr ctx pctx)
+           goal))
 
-    ;; This is a basic sanity test
-    (test-regimes 'x '(1 0))
+  ;; This is a basic sanity test
+  (test-regimes 'x '(1 0))
 
-    ;; This test ensures we handle equal points correctly. All points
-    ;; are equal along the `1` axis, so we should only get one
-    ;; splitpoint (the second, since it is better at the further point).
-    (test-regimes (literal 1 'binary64) '(0))
+  ;; This test ensures we handle equal points correctly. All points
+  ;; are equal along the `1` axis, so we should only get one
+  ;; splitpoint (the second, since it is better at the further point).
+  (test-regimes (literal 1 'binary64) '(0))
 
-    (test-regimes `(if (==.f64 x ,(literal 0.5 'binary64))
-                       ,(literal 1 'binary64)
-                       (NAN.f64))
-                  '(1 0))))
+  (test-regimes `(if.f64 (==.f64 x ,(literal 0.5 'binary64)) ,(literal 1 'binary64) (NAN.f64))
+                '(1 0)))
 
 ;; Given error-lsts, returns a list of sp objects representing where the optimal splitpoints are.
 (define (valid-splitindices? can-split? split-indices)
@@ -216,6 +207,7 @@
 
     ;; Set up data needed for algorithm
     (define number-of-points (vector-length can-split-vec))
+    (define number-of-alts (vector-length flvec-psums))
     ;; min-weight is used as penalty to favor not adding split points
     (define min-weight (fl number-of-points))
 
@@ -240,10 +232,10 @@
     ;; best alt.
     (: best-alt-idxs (Vectorof Integer))
     (: best-alt-costs FlVector)
-    (define best-alt-idxs (make-vector number-of-points -1))
+    (define best-alt-idxs (make-vector number-of-points number-of-alts))
     (define best-alt-costs (make-flvector number-of-points))
 
-    (for ([point-idx (in-range 0 number-of-points)]
+    (for ([point-idx (in-range number-of-points)]
           [current-alt-error (in-flvector result-error-sums)]
           [current-alt-idx (in-vector result-alt-idxs)]
           [current-prev-idx (in-vector result-prev-idxs)])
@@ -256,7 +248,7 @@
       (for ([alt-idx (in-naturals)]
             [alt-error-sums (in-vector flvec-psums)])
         ;; Loop over the points up to our current point
-        (for ([prev-split-idx (in-range 0 point-idx)]
+        (for ([prev-split-idx (in-range point-idx)]
               [prev-alt-error-sum (in-flvector alt-error-sums)]
               [best-alt-idx (in-vector best-alt-idxs)]
               [best-alt-cost (in-flvector best-alt-costs)]
@@ -267,14 +259,14 @@
           (let ([current-error (- (flvector-ref alt-error-sums point-idx) prev-alt-error-sum)])
             ;; if we have not set the best alt yet or
             ;; the current alt-error-sum is less then previous
-            (when (or (= best-alt-idx -1) (< current-error best-alt-cost))
+            (when (or (= best-alt-idx number-of-alts) (< current-error best-alt-cost))
               ;; update best cost and best index
               (flvector-set! best-alt-costs prev-split-idx current-error)
               (vector-set! best-alt-idxs prev-split-idx alt-idx)))))
       ;; We have now have the index of the best alt and its error up to our
       ;; current point-idx.
       ;; Now we compare against our current best saved in the 3 vectors above
-      (for ([prev-split-idx (in-range 0 point-idx)]
+      (for ([prev-split-idx (in-range point-idx)]
             [r-error-sum (in-flvector result-error-sums)]
             [best-alt-idx (in-vector best-alt-idxs)]
             [best-alt-cost (in-flvector best-alt-costs)]
@@ -305,7 +297,7 @@
 
     ;; Loop over results vectors in reverse and build the output split index list
     (let loop ([i (- number-of-points 1)]
-               [rest (cast null (Listof si))])
+               [rest (ann null (Listof si))])
       (define alt-idx (vector-ref result-alt-idxs i))
       (define next (vector-ref result-prev-idxs i))
       (define sis (cons (si alt-idx (+ i 1)) rest))

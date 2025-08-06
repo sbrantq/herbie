@@ -1,12 +1,15 @@
 #lang racket
 
 (require racket/hash)
-(require "../utils/common.rkt"
-         "../utils/alternative.rkt"
-         "points.rkt"
-         "programs.rkt"
+(require "../utils/alternative.rkt"
+         "../utils/common.rkt"
+         "../utils/pareto.rkt"
          "../syntax/types.rkt"
-         "../utils/pareto.rkt")
+         "../syntax/syntax.rkt"
+         "../syntax/platform.rkt"
+         "batch.rkt"
+         "points.rkt"
+         "programs.rkt")
 
 (provide (contract-out
           (make-alt-table (pcontext? alt? any/c . -> . alt-table?))
@@ -14,7 +17,7 @@
           (atab-all-alts (alt-table? . -> . (listof alt?)))
           (atab-not-done-alts (alt-table? . -> . (listof alt?)))
           (atab-eval-altns (alt-table? (listof alt?) context? . -> . (values any/c any/c)))
-          (atab-add-altns (alt-table? (listof alt?) any/c any/c . -> . alt-table?))
+          (atab-add-altns (alt-table? (listof alt?) any/c any/c context? . -> . alt-table?))
           (atab-set-picked (alt-table? (listof alt?) . -> . alt-table?))
           (atab-completed? (alt-table? . -> . boolean?))
           (atab-min-errors (alt-table? . -> . (listof real?)))))
@@ -23,22 +26,28 @@
 
 (struct alt-table (point-idx->alts alt->point-idxs alt->done? alt->cost pcontext all) #:prefab)
 
-(define (backup-alt-cost altn)
-  (let loop ([expr (alt-expr altn)])
-    (match expr
-      [(list 'if cond ift iff) (+ 1 (loop cond) (max (loop ift) (loop iff)))]
-      [(list op args ...) (apply + 1 (map loop args))]
-      [_ 1])))
-
-; In normal mode, cost is not considered so we return a constant
-; The alt table becomes "degenerate"
-(define (alt-cost* altn repr)
-  (if (*pareto-mode*)
-      (alt-cost altn repr)
-      1))
+(define (alt-batch-cost batch repr)
+  (define node-cost-proc (platform-node-cost-proc (*active-platform*)))
+  (define costs (make-vector (batch-length batch) 0))
+  (for ([node (in-batch batch)]
+        [i (in-naturals)])
+    (define cost
+      (match node
+        [(? literal?) ((node-cost-proc node repr))]
+        [(? symbol?) ((node-cost-proc node repr))]
+        [(? number?) 0] ; specs
+        [(approx _ impl) (vector-ref costs impl)]
+        [(list (? (negate impl-exists?) impl) args ...) 0] ; specs
+        [(list impl args ...)
+         (define cost-proc (node-cost-proc node repr))
+         (define itypes (impl-info impl 'itype))
+         (apply cost-proc (map (curry vector-ref costs) args))]))
+    (vector-set! costs i cost))
+  (for/list ([root (in-vector (batch-roots batch))])
+    (vector-ref costs root)))
 
 (define (make-alt-table pcontext initial-alt ctx)
-  (define cost (alt-cost* initial-alt (context-repr ctx)))
+  (define cost (alt-cost initial-alt (context-repr ctx)))
   (define errs (errors (alt-expr initial-alt) pcontext ctx))
   (alt-table (for/vector #:length (pcontext-length pcontext)
                          ([err (in-list errs)])
@@ -123,32 +132,39 @@
       (vector-set! coverage j #f)
       (set-remove! removable last))))
 
-(define (worst atab removable)
-  ;; Metrics for "worst" alt
-  (define (alt-num-points a)
-    (length (hash-ref (alt-table-alt->point-idxs atab) a)))
-  (define (alt-done? a)
-    (if (hash-ref (alt-table-alt->done? atab) a) 1 0))
-  (define (alt-cost a)
-    (if (*pareto-mode*)
-        (hash-ref (alt-table-alt->cost atab) a)
-        (backup-alt-cost a)))
-  ;; Rank by multiple metrics
-  (define not-done (argmins alt-done? (set->list removable)))
-  (define least-best-points (argmins alt-num-points not-done))
-  (define worst-cost (argmaxs alt-cost least-best-points))
-  ;; The set may have non-deterministic behavior,
-  ;; so we can only rely on some total order
-  (first (order-altns worst-cost)))
+(define ((removability<? atab) alt1 alt2)
+  (define alt1-done? (hash-ref (alt-table-alt->done? atab) alt1))
+  (define alt2-done? (hash-ref (alt-table-alt->done? atab) alt2))
+  (cond
+    [(and (not alt1-done?) alt2-done?) #t]
+    [(and alt1-done? (not alt2-done?)) #f]
+    [else
+     (define alt1-num (length (hash-ref (alt-table-alt->point-idxs atab) alt1)))
+     (define alt2-num (length (hash-ref (alt-table-alt->point-idxs atab) alt2)))
+     (cond
+       [(< alt1-num alt2-num) #t]
+       [(> alt1-num alt2-num) #f]
+       [else
+        (define alt1-cost (hash-ref (alt-table-alt->cost atab) alt1))
+        (define alt2-cost (hash-ref (alt-table-alt->cost atab) alt2))
+        (cond
+          [(< alt1-cost alt2-cost) #f]
+          [(< alt2-cost alt1-cost) #t]
+          [else (expr<? (alt-expr alt1) (alt-expr alt2))])])]))
 
 (define (atab-prune atab)
   (define sc (atab->set-cover atab))
-  (let loop ([removed '()])
-    (if (set-empty? (set-cover-removable sc))
-        (apply atab-remove* atab removed)
-        (let ([worst-alt (worst atab (set-cover-removable sc))])
+  (define removability (sort (set->list (set-cover-removable sc)) (removability<? atab)))
+  (let loop ([removed '()]
+             [removability removability])
+    (match removability
+      ['() (apply atab-remove* atab removed)]
+      [(cons worst-alt other-alts)
+       (cond
+         [(set-member? (set-cover-removable sc) worst-alt)
           (set-cover-remove! sc worst-alt)
-          (loop (cons worst-alt removed))))))
+          (loop (cons worst-alt removed) other-alts)]
+         [else (loop removed other-alts)])])))
 
 (define (hash-remove* hash keys)
   (for/fold ([hash hash]) ([key keys])
@@ -168,17 +184,18 @@
                [alt->cost (hash-remove* alt->cost altns)]))
 
 (define (atab-eval-altns atab altns ctx)
-  (define errss (batch-errors (map alt-expr altns) (alt-table-pcontext atab) ctx))
-  (define costs (map (curryr alt-cost* (context-repr ctx)) altns))
+  (define batch (progs->batch (map alt-expr altns) #:vars (context-vars ctx)))
+  (define errss (batch-errors batch (alt-table-pcontext atab) ctx))
+  (define costs (alt-batch-cost batch (context-repr ctx)))
   (values errss costs))
 
-(define (atab-add-altns atab altns errss costs)
+(define (atab-add-altns atab altns errss costs ctx)
   (define atab*
     (for/fold ([atab atab])
               ([altn (in-list altns)]
                [errs (in-list errss)]
                [cost (in-list costs)])
-      (atab-add-altn atab altn errs cost)))
+      (atab-add-altn atab altn errs cost ctx)))
   (define atab**
     (struct-copy alt-table atab* [alt->point-idxs (invert-index (alt-table-point-idx->alts atab*))]))
   (define atab*** (atab-prune atab**))
@@ -194,27 +211,22 @@
         [idx (in-naturals)])
     (for* ([ppt (in-list pcurve)]
            [alt (in-list (pareto-point-data ppt))])
-      (hash-set! alt->points* alt (cons idx (hash-ref alt->points* alt '())))))
+      (hash-update! alt->points* alt (λ (v) (cons idx v)) '())))
   (make-immutable-hasheq (hash->list alt->points*)))
 
-(define (atab-add-altn atab altn errs cost)
+(define (atab-add-altn atab altn errs cost ctx)
   (match-define (alt-table point-idx->alts alt->point-idxs alt->done? alt->cost pcontext _) atab)
+  (define max-error (+ 1 (expt 2 (representation-total-bits (context-repr ctx)))))
 
   (define point-idx->alts*
     (for/vector #:length (vector-length point-idx->alts)
                 ([pcurve (in-vector point-idx->alts)]
                  [err (in-list errs)])
-      (define ppt (pareto-point cost err (list altn)))
-      (pareto-union (list ppt)
-                    pcurve
-                    #:combine (lambda (alts1 alts2)
-                                ; dedup by program
-                                ; optimization: combining means that `alts1` corresponds to
-                                ; the new pareto point
-                                (match-define (list altn) alts1)
-                                (if (ormap (lambda (a) (alt-equal? a altn)) alts2)
-                                    alts2
-                                    (cons altn alts2))))))
+      (cond
+        [(< err max-error) ; Only include points if they are valid
+         (define ppt (pareto-point cost err (list altn)))
+         (pareto-union (list ppt) pcurve #:combine append)]
+        [else pcurve])))
 
   (alt-table point-idx->alts*
              (hash-set alt->point-idxs altn #f)

@@ -9,29 +9,17 @@
          drop-at
          find-duplicates
          partial-sums
-         argmins
-         argmaxs
-         set-disjoint?
-         subsequence?
-         list-set*
-         disjoint-set
-         disjoint-set-find!
-         disjoint-set-union!
          get-seed
          set-seed!
          quasisyntax
-         dict
          sym-append
-         gen-vars
-         string-replace*
          format-time
          format-bits
-         format-accuracy
-         format-cost
          web-resource
          prop-dict/c
          props->dict
          dict->props
+         fpcore->string
          (all-from-out "../config.rkt"))
 
 (module+ test
@@ -50,39 +38,6 @@
       body ...)
     (values (reverse ((car sows))) ...)))
 
-;; Single precision numbers
-
-(define cast-single
-  (let ([flsingle identity])
-    (local-require racket/flonum)
-    flsingle))
-
-;; Utility list functions
-
-(define (argmins f lst)
-  (let loop ([lst lst]
-             [best-score #f]
-             [best-elts '()])
-    (if (null? lst)
-        (reverse best-elts)
-        (let* ([elt (car lst)]
-               [lst* (cdr lst)]
-               [score (f elt)])
-          (cond
-            [(not best-score) (loop lst* score (list elt))]
-            [(< score best-score) (loop lst* score (list elt))]
-            [(> score best-score) (loop lst* best-score best-elts)]
-            [(= score best-score) (loop lst* best-score (cons elt best-elts))])))))
-
-(module+ test
-  (check-equal? (argmins string-length '("a" "bb" "f" "ccc" "dd" "eee" "g")) '("a" "f" "g")))
-
-(define (argmaxs f lst)
-  (argmins (λ (x) (- (f x))) lst))
-
-(module+ test
-  (check-equal? (argmaxs string-length '("a" "bb" "f" "ccc" "dd" "eee" "g")) '("ccc" "eee")))
-
 (define (drop-at ls index)
   (define-values (front back) (split-at ls index))
   (append front (rest back)))
@@ -97,92 +52,16 @@
 (define (partial-sums vec)
   (define res (make-vector (vector-length vec)))
   (for/fold ([cur-psum 0]) ([(el idx) (in-indexed (in-vector vec))])
-    (let ([new-psum (+ cur-psum el)])
-      (vector-set! res idx new-psum)
-      new-psum))
+    (define new-psum (+ cur-psum el))
+    (vector-set! res idx new-psum)
+    new-psum)
   res)
 
 (module+ test
   (check-equal? (partial-sums #(1 4 6 3 8)) #(1 5 11 14 22)))
 
 (define (find-duplicates l)
-  (define found (mutable-set))
-  (define duplicates '())
-  (for ([x l])
-    (when (set-member? found x)
-      (set! duplicates (cons x duplicates)))
-    (set-add! found x))
-  (reverse duplicates))
-
-(define (set-disjoint? s1 s2)
-  (set-empty? (set-intersect s2 s1)))
-
-(module+ test
-  (check-true (set-disjoint? '(a b c) '(e f g)))
-  (check-true (set-disjoint? '() '()))
-  (check-false (set-disjoint? '(a b c) '(a))))
-
-(define (subsequence? v l)
-  (or (empty? v) (let ([v* (member (first v) l)]) (and v* (subsequence? (rest v) v*)))))
-
-(module+ test
-  (define l (range 10))
-  (check-true (subsequence? empty empty))
-  (check-true (subsequence? empty l))
-  (check-true (subsequence? '(1) l))
-  (check-true (subsequence? '(1 2) l))
-  (check-true (subsequence? '(1 3 5 7 9) l))
-  (check-true (subsequence? '(1 2 5 8) l))
-  (check-false (subsequence? '(x y) l))
-  (check-false (subsequence? '(1 2 10) l)))
-
-(define (list-set* l p v)
-  (let loop ([l l]
-             [p p]
-             [v v]
-             [i 0])
-    (cond
-      [(empty? l) empty]
-      [(and (not (empty? p)) (equal? (first p) i))
-       (cons (first v) (loop (rest l) (rest p) (rest v) (add1 i)))]
-      [else (cons (first l) (loop (rest l) p v (add1 i)))])))
-
-(module+ test
-  (define n '(a b c d e f g))
-  (check-equal? (list-set* empty empty empty) empty)
-  (check-equal? (list-set* n empty empty) n)
-  (check-equal? (list-set* n '(0) '(x)) '(x b c d e f g))
-  (check-equal? (list-set* n '(1 2 5) '(x y z)) '(a x y d e z g)))
-
-;; Union-find
-
-(define (disjoint-set s)
-  (list->vector (range s)))
-
-(define (disjoint-set-find! d x)
-  (define p (vector-ref d x))
-  (if (= p x)
-      x
-      (let ([r (disjoint-set-find! d p)])
-        (vector-set! d x r)
-        r)))
-
-(define (disjoint-set-union! d x y)
-  (vector-set! d y x))
-
-;; Miscellaneous helper
-
-(define the-seed #f)
-
-(define (get-seed)
-  (or the-seed (error "Seed is not set yet!")))
-
-(define (set-seed! seed)
-  "Reset the random number generator to a new seed"
-  (set! the-seed seed)
-  (if (vector? seed)
-      (current-pseudo-random-generator (vector->pseudo-random-generator seed))
-      (random-seed seed)))
+  (map car (filter (compose pair? rest) (group-by identity l))))
 
 ;; Matching support for syntax objects.
 
@@ -206,13 +85,6 @@
                         [a #'(quasisyntax a)]))])
          #`(app syntax-e #,(datum->syntax stx (cons #'list parts))))]
       [(_ a) #'(app syntax-e 'a)])))
-
-(define-match-expander dict
-  (λ (stx)
-    (syntax-case stx (quote)
-      [(_) #'(? dict?)]
-      [(dict 'x y rest ...)
-       #'(and (dict rest ...) (? (curryr dict-has-key? 'x)) (app (curryr dict-ref 'x) y))])))
 
 ;; String formatting operations
 
@@ -249,25 +121,8 @@
   (define unit (if unit? "b" ""))
   (cond
     [(not r) ""]
-    [(and (> r 0) sign) (format "+~a~a" (/ (round (* r 10)) 10) unit)]
+    [(and (positive? r) sign) (format "+~a~a" (/ (round (* r 10)) 10) unit)]
     [else (format "~a~a" (/ (round (* r 10)) 10) unit)]))
-
-(define (format-accuracy numerator denominator #:sign [sign #f] #:unit [unit ""])
-  (if (and numerator (positive? denominator))
-      (let ([percent (~r (- 100 (* (/ numerator denominator) 100)) #:precision '(= 1))])
-        (if (and (> numerator 0) sign)
-            (format "+~a~a" percent unit)
-            (format "~a~a" percent unit)))
-      ""))
-
-(define (format-cost r repr #:sign [sign #f])
-  (cond
-    [(not r) ""]
-    [else
-     (define val (~r (/ (round (* r 10)) 10) #:precision 2))
-     (cond
-       [(and (> r 0) sign) (format "+~a" val)]
-       [else (format "~a" val)])]))
 
 (define-runtime-path web-resource-path "../reports/resources/")
 
@@ -276,29 +131,17 @@
       (build-path web-resource-path name)
       web-resource-path))
 
-(define/contract (string-replace* str changes)
-  (-> string? (listof (cons/c string? string?)) string?)
-  (for/fold ([str str]) ([change changes])
-    (match-define (cons from to) change)
-    (string-replace str from to)))
-
 ;; Symbol generation
 
 (define (sym-append . args)
   (string->symbol (apply string-append (map ~a args))))
-
-;; Generates a list of variables names.
-(define/contract (gen-vars n)
-  (-> natural? (listof symbol?))
-  (build-list n (lambda (i) (string->symbol (format "x~a" i)))))
 
 ;; FPCore properties
 
 (define prop-dict/c (listof (cons/c symbol? any/c)))
 
 ;; Prop list to dict
-(define/contract (props->dict props)
-  (-> list? (listof (cons/c symbol? any/c)))
+(define (props->dict props)
   (let loop ([props props]
              [dict '()])
     (match props
@@ -306,8 +149,21 @@
       [(list key) (error 'props->dict "unmatched key" key)]
       [(list) dict])))
 
-(define/contract (dict->props prop-dict)
-  (-> (listof (cons/c symbol? any/c)) list?)
+(define (dict->props prop-dict)
   (apply append
          (for/list ([(k v) (in-dict prop-dict)])
            (list k v))))
+
+(define (fpcore->string core)
+  (define-values (ident args props expr)
+    (match core
+      [(list 'FPCore name (list args ...) props ... expr) (values name args props expr)]
+      [(list 'FPCore (list args ...) props ... expr) (values #f args props expr)]))
+  (define props* ; make sure each property (name, value) gets put on the same line
+    (for/list ([(prop name) (in-dict (props->dict props))])
+      (format "~a ~a" prop (pretty-format name (- 69 (string-length (~a prop))) #:mode 'write))))
+  (define top
+    (if ident
+        (format "FPCore ~a ~a" ident args)
+        (format "FPCore ~a" args)))
+  (format "(~a\n  ~a\n  ~a)" top (string-join props* "\n  ") (pretty-format expr 70 #:mode 'write)))

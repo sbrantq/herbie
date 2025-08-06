@@ -4,7 +4,7 @@ help:
 	@echo "Type 'make install' to install Herbie"
 	@echo "Then type 'racket -l herbie web' to run it."
 
-install: clean egg-herbie update
+install: clean egg-herbie egglog-herbie update
 
 clean:
 	raco pkg remove --force --no-docs herbie && echo "Uninstalled old herbie" || :
@@ -28,6 +28,10 @@ egg-herbie:
 	raco pkg remove --force --no-docs egg-herbie-macosm1 && echo "Warning: uninstalling egg-herbie and reinstalling local version" || :
 	raco pkg install ./egg-herbie
 
+egglog-herbie:
+	cargo install --locked --git https://github.com/egraphs-good/egglog.git --rev 052a330de22d40e9eded19e7f0891c921f7f458c
+
+
 distribution: minimal-distribution
 	cp -r bench herbie-compiled/
 
@@ -43,19 +47,18 @@ minimal-distribution:
 
 nightly: install
 	bash infra/nightly.sh bench/ reports/ --threads 4
-	bash infra/publish.sh upload reports/
 
 upgrade:
 	git pull
 	$(MAKE) install
 
 start-server:
-	racket -y src/main.rkt web --seed 1 --timeout 150 --num-iters 2 \
+	racket -y src/main.rkt web --seed 1 --timeout 150 --threads 8 \
 		--demo --public --prefix /demo/ --port 4053 --save-session www/demo/ \
 		--log infra/server.log --quiet 2>&1
 
 fmt:
-	@raco fmt -i $(shell find egg-herbie/ src/ infra/ -name '*.rkt')
+	@raco fmt -i $(shell find egg-herbie/ src/ infra/ -name '*.rkt' -not -path 'src/platforms/*.rkt' -not -path "infra/softposit.rkt")
 
 herbie.zip herbie.zip.CHECKSUM:
 	raco pkg create src/

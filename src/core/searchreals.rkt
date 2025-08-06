@@ -3,12 +3,12 @@
 (require math/bigfloat
          rival)
 
-(require "../syntax/types.rkt"
-         "../core/rival.rkt"
-         "../utils/timeline.rkt"
-         "../utils/errors.rkt"
+(require "../utils/errors.rkt"
+         "../utils/float.rkt"
          "../utils/pretty-print.rkt"
-         "../utils/float.rkt")
+         "../utils/timeline.rkt"
+         "../syntax/types.rkt"
+         "../core/rival.rkt")
 
 (provide find-intervals
          hyperrect-weight)
@@ -19,12 +19,12 @@
   (search-space '() '() ranges '() (make-list (length ranges) #f)))
 
 (define (total-weight reprs)
-  (expt 2 (apply + (map representation-total-bits reprs))))
+  (expt 2 (apply + (vector->list (vector-map representation-total-bits reprs)))))
 
 (define (hyperrect-weight hyperrect reprs)
   (apply *
          (for/list ([interval (in-list hyperrect)]
-                    [repr (in-list reprs)])
+                    [repr (in-vector reprs)])
            (define ->ordinal
              (compose (representation-repr->ordinal repr) (representation-bf->repr repr)))
            (+ 1 (- (->ordinal (ival-hi interval)) (->ordinal (ival-lo interval)))))))
@@ -47,8 +47,8 @@
         (warn 'ground-truth
               #:url "faq.html#ground-truth"
               "could not determine a ground truth"
-              #:extra (for/list ([var vars]
-                                 [repr reprs]
+              #:extra (for/list ([var (in-vector vars)]
+                                 [repr (in-vector reprs)]
                                  [ival rect])
                         (define val
                           (value->string ((representation-bf->repr repr)
@@ -61,7 +61,7 @@
          (values (cons rect true*) false* other* (cons hint* true-hints*) other-hints*)]
         [else
          (define range (list-ref rect split-var))
-         (define repr (list-ref reprs split-var))
+         (define repr (vector-ref reprs split-var))
          (match (two-midpoints repr (ival-lo range) (ival-hi range))
            [(cons midleft midright)
             (define rect-lo (list-set rect split-var (ival (ival-lo range) midleft)))
@@ -89,16 +89,14 @@
 
 (define (find-intervals compiler rects #:fuel [depth 128])
   (define var-reprs (real-compiler-var-reprs compiler))
-  (if (or (null? rects) (null? (first rects)))
-      (map (curryr cons 'other) rects)
-      (let loop ([space (apply make-search-space rects)]
-                 [n 0])
-        (match-define (search-space true false other true-hints other-hints) space)
-        (timeline-push! 'sampling n (make-sampling-table var-reprs true false other))
+  (let loop ([space (apply make-search-space rects)]
+             [n 0])
+    (match-define (search-space true false other true-hints other-hints) space)
+    (timeline-push! 'sampling n (make-sampling-table var-reprs true false other))
 
-        (define n* (remainder n (length (first rects))))
-        (if (or (>= n depth) (empty? (search-space-other space)) (>= (length other) (expt 2 depth)))
-            (list (append (search-space-true space) (search-space-other space))
-                  (append (search-space-true-hints space) (search-space-other-hints space))
-                  (make-sampling-table var-reprs true false other))
-            (loop (search-step compiler space n*) (+ n 1))))))
+    (define n* (remainder n (vector-length var-reprs)))
+    (if (or (>= n depth) (empty? (search-space-other space)) (>= (length other) (expt 2 depth)))
+        (list (append (search-space-true space) (search-space-other space))
+              (append (search-space-true-hints space) (search-space-other-hints space))
+              (make-sampling-table var-reprs true false other))
+        (loop (search-step compiler space n*) (+ n 1)))))

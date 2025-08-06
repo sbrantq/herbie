@@ -1,7 +1,7 @@
 #lang info
 
 (define collection "herbie")
-(define version "2.2")
+(define version "2.3")
 (define license 'MIT)
 
 ;; Packaging information
@@ -20,8 +20,8 @@
                              "profile-lib"
                              "rackunit-lib"
                              "web-server-lib"
-                             ("egg-herbie" #:version "2.0")
-                             ("rival" #:version "2.0")
+                             ("egg-herbie" #:version "2.2")
+                             ("rival" #:version "2.2")
                              ("fpbench" #:version "2.0.3")
                              "fmt"))
 

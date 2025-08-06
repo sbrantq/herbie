@@ -5,16 +5,16 @@
          "../src/utils/profile.rkt"
          "../src/api/datafile.rkt"
          "../src/reports/timeline.rkt"
-         "../src/syntax/load-plugin.rkt"
-         "../src/reports/common.rkt")
+         "../src/reports/common.rkt"
+         "../src/syntax/platform.rkt"
+         "../src/syntax/load-platform.rkt")
 
 (define (merge-timelines outdir . dirs)
   (define tls
     (filter (conjoin (negate eof-object?) identity)
             (for/list ([dir (in-list dirs)])
               (with-handlers ([exn? (const #f)])
-                (define tl (call-with-input-file (build-path outdir dir "timeline.json") read-json))
-                (timeline-relink dir tl)))))
+                (call-with-input-file (build-path outdir dir "timeline.json") read-json)))))
   (define info (call-with-input-file (build-path outdir (first dirs) "results.json") read-datafile))
   (define joint-tl (apply timeline-merge tls))
   (call-with-output-file (build-path outdir "timeline.json")
@@ -37,16 +37,15 @@
                          (curry write-json (profile->json joint-pf))))
 
 (define (merge-reports outdir . dirs)
-  (load-herbie-builtins)
   (define rss
     (filter (conjoin (negate eof-object?) identity)
             (for/list ([dir (in-list dirs)])
               (with-handlers ([exn? (const #f)])
-                (let ([df (call-with-input-file (build-path outdir dir "results.json")
-                                                read-datafile)])
-                  (if (eof-object? df)
-                      eof
-                      (cons df dir)))))))
+                (define df
+                  (call-with-input-file (build-path outdir dir "results.json") read-datafile))
+                (if (eof-object? df)
+                    eof
+                    (cons df dir))))))
   (define dfs (map car rss))
   (define joint-rs (merge-datafiles dfs #:dirs dirs))
   (write-datafile (build-path outdir "results.json") joint-rs)
@@ -54,6 +53,7 @@
 
 (module+ main
   (command-line #:args (outdir . dirs)
+                (activate-platform! (*platform-name*))
                 (apply merge-reports outdir dirs)
                 (apply merge-timelines outdir dirs)
                 (apply merge-profiles outdir dirs)

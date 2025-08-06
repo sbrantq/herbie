@@ -7,9 +7,12 @@
          "../syntax/read.rkt"
          "../syntax/sugar.rkt"
          "../syntax/types.rkt"
+         "../syntax/platform.rkt"
+         "../syntax/load-platform.rkt"
          "../utils/common.rkt"
          "../utils/profile.rkt"
          "../utils/timeline.rkt"
+         "../core/points.rkt"
          "datafile.rkt"
          "sandbox.rkt"
          "server.rkt")
@@ -30,19 +33,20 @@
         (table-row-target-prog row)
         (fpcore->prog (table-row-spec row) ctx)
         (fpcore->prog (table-row-pre row) ctx)
-        (table-row-preprocess row)
         (representation-name repr)
         (for/list ([(k v) (in-dict var-reprs)])
           (cons k (representation-name v)))
         (table-row-conversions row)))
 
 (define (make-report bench-dirs #:dir dir #:threads threads)
+  (activate-platform! (*platform-name*))
   (define tests (reverse (sort (append-map load-tests bench-dirs) test<?)))
   (run-tests tests #:dir dir #:threads threads))
 
 (define (rerun-report json-file #:dir dir #:threads threads)
   (define data (call-with-input-file json-file read-datafile))
   (define tests (map extract-test (report-info-tests data)))
+  (activate-platform! (*platform-name*))
   (*flags* (report-info-flags data))
   (set-seed! (report-info-seed data))
   (*num-points* (report-info-points data))
@@ -55,16 +59,12 @@
             (define out
               (with-handlers ([exn? (const #f)])
                 (call-with-input-file (build-path dir (table-row-link res) name) read-json)))
-            (and out (not (eof-object? out)) (cons (table-row-link res) out)))))
-
-(define (merge-timeline-jsons tl)
-  (apply timeline-merge (map timeline-relink (dict-keys tl) (dict-values tl))))
+            (and out (not (eof-object? out)) out))))
 
 (define (merge-profile-jsons ps)
-  (profile->json (apply profile-merge (map json->profile (dict-values ps)))))
+  (profile->json (apply profile-merge (map json->profile ps))))
 
-(define (generate-bench-report job-id bench-name test-number dir number-of-test)
-  (define result (wait-for-job job-id))
+(define (generate-bench-report result bench-name test-number dir total-tests)
   (define report-path (bench-folder-path bench-name test-number))
   (define report-directory (build-path dir report-path))
   (unless (directory-exists? report-directory)
@@ -74,29 +74,29 @@
     (call-with-output-file (build-path report-directory page)
                            #:exists 'replace
                            (λ (out)
-                             (with-handlers ([exn:fail? (λ (e)
-                                                          ((page-error-handler result page out) e))])
-                               (make-page page out result #t #f)))))
+                             (with-handlers ([exn:fail? (page-error-handler result page out)])
+                               (make-page-timeout page out result #t #f #:timeout 10000)))))
 
-  (define table-data (get-table-data-from-hash result report-path))
-  (print-test-result (+ test-number 1) number-of-test table-data)
-  table-data)
+  (get-table-data-from-hash result report-path))
 
 (define (run-tests tests #:dir dir #:threads threads)
   (define seed (get-seed))
   (unless (directory-exists? dir)
     (make-directory dir))
 
-  (start-job-server threads)
+  (server-start threads)
   (define job-ids
     (for/list ([test (in-list tests)])
-      (start-job 'improve test #:seed seed #:pcontext #f #:profile? #t #:timeline-disabled? #f)))
+      (job-start 'improve test #:seed seed #:pcontext #f #:profile? #t #:timeline? #t)))
 
+  (define total-tests (length tests))
   (define results
     (for/list ([job-id (in-list job-ids)]
                [test (in-list tests)]
                [test-number (in-naturals)])
-      (generate-bench-report job-id (test-name test) test-number dir (length tests))))
+      (define result (job-wait job-id))
+      (print-test-result (+ test-number 1) total-tests test result)
+      (generate-bench-report result (test-name test) test-number dir total-tests)))
 
   (define info (make-report-info results #:seed seed))
   (write-datafile (build-path dir "results.json") info)
@@ -105,7 +105,7 @@
   (copy-file (web-resource "report.css") (build-path dir "report.css") #t)
   (copy-file (web-resource "logo-car.png") (build-path dir "logo-car.png") #t)
   (copy-file (web-resource "report.html") (build-path dir "index.html") #t)
-  (define timeline (merge-timeline-jsons (read-json-files info dir "timeline.json")))
+  (define timeline (apply timeline-merge (read-json-files info dir "timeline.json")))
   (call-with-output-file (build-path dir "timeline.json")
                          (curry write-json timeline)
                          #:exists 'replace)
@@ -139,16 +139,29 @@
   (define replaced (string-replace bench-name #px"\\W+" ""))
   (format "~a-~a" index (substring replaced 0 (min (string-length replaced) 50))))
 
-(define (print-test-result i n data)
+(define (hash-ref-path hash . path)
+  (match path
+    ['() hash]
+    [(cons (? symbol? key) rest) (apply hash-ref-path (hash-ref hash key) rest)]
+    [(cons (? integer? key) rest) (apply hash-ref-path (list-ref hash key) rest)]))
+
+(define (print-test-result i n test result-hash)
   (eprintf "~a/~a\t" (~a i #:width 3 #:align 'right) n)
-  (define bits (representation-total-bits (get-representation (table-row-precision data))))
-  (match (table-row-status data)
-    ["error" (eprintf "[ ERROR ]\t\t~a\n" (table-row-name data))]
-    ["crash" (eprintf "[ CRASH ]\t\t~a\n" (table-row-name data))]
-    ["timeout" (eprintf "[TIMEOUT]\t\t~a\n" (table-row-name data))]
+  (define name (test-name test))
+  (match (hash-ref-path result-hash 'status)
+    ["failure"
+     (match-define (list 'exn type msg url locs tb) (hash-ref-path result-hash 'backend))
+     (if type
+         (eprintf "[ ERROR ]\t\t~a\n" name)
+         (eprintf "[ CRASH ]\t\t~a\n" name))]
+    ["timeout" (eprintf "[TIMEOUT]\t\t~a\n" name)]
     [_
+     (define bits (representation-total-bits (test-output-repr test)))
+     (define time (hash-ref-path result-hash 'time))
+     (define start-score (errors-score (hash-ref-path result-hash 'backend 'start 'errors)))
+     (define end-score (errors-score (hash-ref-path result-hash 'backend 'end 0 'errors)))
      (eprintf "[~as]  ~a% → ~a%\t~a\n"
-              (~r (/ (table-row-time data) 1000) #:min-width 6 #:precision '(= 1))
-              (~r (* 100 (- 1 (/ (table-row-start data) bits))) #:min-width 3 #:precision 0)
-              (~r (* 100 (- 1 (/ (table-row-result data) bits))) #:min-width 3 #:precision 0)
-              (table-row-name data))]))
+              (~r (/ time 1000) #:min-width 6 #:precision '(= 1))
+              (~r (* 100 (- 1 (/ start-score bits))) #:min-width 3 #:precision 0)
+              (~r (* 100 (- 1 (/ end-score bits))) #:min-width 3 #:precision 0)
+              name)]))

@@ -3,20 +3,17 @@
 (require racket/set
          math/bigfloat
          racket/hash)
-(require "points.rkt"
-         "../syntax/types.rkt"
-         "localize.rkt"
-         "../utils/common.rkt"
-         "sampling.rkt"
-         "../syntax/sugar.rkt"
-         "../utils/alternative.rkt"
-         "programs.rkt"
+(require "../utils/common.rkt"
          "../utils/float.rkt"
-         "../config.rkt"
-         "../syntax/syntax.rkt")
+         "../syntax/types.rkt"
+         "../syntax/syntax.rkt"
+         "../syntax/platform.rkt"
+         "localize.rkt"
+         "points.rkt"
+         "programs.rkt"
+         "sampling.rkt")
 
 (provide explain)
-(provide get-locations)
 
 (define *top-3* (make-parameter #f))
 
@@ -39,11 +36,10 @@
     [(symbol? expr) #f]
     [else #t]))
 
-(define (actual-errors expr pcontext)
+(define (actual-errors expr ctx pcontext)
   (match-define (cons subexprs pt-errorss)
-    (parameterize ([*pcontext* pcontext])
-      (flip-lists (hash->list (first (compute-local-errors (list (all-subexpressions expr))
-                                                           (*context*)))))))
+    (flip-lists
+     (hash->list (first (compute-local-errors (list (all-subexpressions expr)) ctx pcontext)))))
 
   (define pt-worst-subexpr
     (append* (reap [sow]
@@ -56,7 +52,8 @@
                        (sow mapped-sub-error))))))
 
   (for/hash ([group (in-list (group-by car pt-worst-subexpr))])
-    (let ([key (caar group)]) (values key (map cdr group)))))
+    (define key (caar group))
+    (values key (map cdr group))))
 
 (define (same-sign? a b)
   (or (and (bfpositive? a) (bfpositive? b)) (and (bfnegative? a) (bfnegative? b))))
@@ -107,7 +104,7 @@
     (define (mark-maybe! expr [expl 'sensitivity])
       (hash-update! maybe-expls->points (cons expr expl) (lambda (x) (set-add x pt)) '()))
 
-    (define exacts (apply subexprs-fn pt))
+    (define exacts (subexprs-fn pt))
 
     (define exacts-hash (make-immutable-hash (map cons subexprs-list exacts)))
     (define (exacts-ref subexpr)
@@ -126,7 +123,7 @@
         (define parent+child-set (hash-union parent-set child-set #:combine (lambda (_ v) v)))
         (define new-parent-set
           (if (and (bigfloat? subexpr-val) (pred? subexpr-val))
-              (hash-update parent+child-set subexpr (lambda (x) (+ x 1)) 0)
+              (hash-update parent+child-set subexpr add1 0)
               parent+child-set))
         (hash-set! flow-hash subexpr new-parent-set))
 
@@ -497,20 +494,6 @@
         [_ #f])))
   (values error-count-hash expls->points maybe-expls->points oflow-hash uflow-hash))
 
-(define (get-locations expr subexpr)
-  (reap [sow]
-        (let loop ([expr expr]
-                   [loc '()])
-          (match expr
-            [(== subexpr) (sow (reverse loc))]
-            [(? literal?) (void)]
-            [(? symbol?) (void)]
-            [(approx _ impl) (loop impl (cons 2 loc))]
-            [(list _ args ...)
-             (for ([arg (in-list args)]
-                   [i (in-naturals 1)])
-               (loop arg (cons i loc)))]))))
-
 (define (generate-timelines expr
                             ctx
                             pctx
@@ -520,11 +503,11 @@
                             oflow-hash
                             uflow-hash)
 
-  (define tcount-hash (actual-errors expr pctx))
+  (define tcount-hash (actual-errors expr ctx pctx))
 
-  (define repr (repr-of expr (*context*)))
+  (define repr (repr-of expr ctx))
   (define (values->json vs repr)
-    (map (lambda (value) (value->json value repr)) vs))
+    (map (lambda (value) (value->json value repr)) (vector->list vs)))
 
   (define fperrors
     (for/list ([subexpr (in-list (set-union (hash-keys tcount-hash) (hash-keys error-count-hash)))])
@@ -599,15 +582,15 @@
 
   (define points->expl (make-hash))
 
-  (for ([(_ points) (in-dict expls->points)])
-    (for ([pt (in-list points)])
-      (hash-update! points->expl pt (lambda (x) (+ 1 x)) 0)))
+  (for* ([(_ points) (in-dict expls->points)]
+         [pt (in-list points)])
+    (hash-update! points->expl pt add1 0))
 
   (define freqs (make-hash))
 
   (for ([(pt _) (in-pcontext pctx)])
     (define freq (hash-ref points->expl pt 0))
-    (hash-update! freqs freq (lambda (x) (+ 1 x)) 0))
+    (hash-update! freqs freq add1 0))
 
   (values fperrors
           sorted-explanations-table

@@ -290,13 +290,15 @@ const CostAccuracy = new Component('#cost-accuracy', {
         // - We make a broken line to show the real Pareto frontier
         let line = []
         let last = null;
-        for (let pt of rest_pts) {
+        rest_pts.forEach((pt, i) => {
+            let target = "alternative" + (i + 1);
+            if (!document.getElementById(target)) return;
             if (!last || pt[1] > last[1]) {
                 if (last) line.push([pt[0], last[1]]);
                 line.push([pt[0], pt[1]]);
                 last = pt;
             }
-        }
+        })
 
         const out = Plot.plot({
             marks: [
@@ -336,6 +338,7 @@ const CostAccuracy = new Component('#cost-accuracy', {
         const bits = benchmark["bits"];
         const initial_accuracy = 100*(1 - initial_pt[1]/bits);
 
+        let alt_number = 0;
         return Element("tbody", [
             Element("tr", [
                 Element("th", "Initial program"),
@@ -343,16 +346,15 @@ const CostAccuracy = new Component('#cost-accuracy', {
                 Element("td", "1.0×")
             ]),
             rest_pts.map((d, i) => {
+                let target = "alternative" + (i + 1);
+                if (!document.getElementById(target)) return;
                 let accuracy = 100*(1 - d[1]/bits);
                 let speedup = initial_pt[0]/d[0];
+                alt_number++;
                 return Element("tr", [
-                    Element("th",
-                        rest_pts.length > 1 ?
-                            Element("a", { href: "#alternative" + (i + 1)},
-                                "Alternative " + (i + 1)) 
-                            // else
-                            : "Alternative " + (i + 1)
-                    ),
+                    Element("th", [
+                        Element("a", { href: "#" + target}, "Alternative " + alt_number) 
+                    ]),
                     Element("td", { className: accuracy >= initial_accuracy ? "better" : "" },
                             accuracy.toFixed(1) + "%"),
                     Element("td", { className: speedup >= 1 ? "better" : "" },
@@ -548,7 +550,7 @@ function makelabel(i, base, factor) {
     return num / den;
 }
 
-function histogram2D(id, xdata, ydata, options) {
+function histogram(id, xdata, ydata, options) {
     var width = options?.width ?? 676;
     var height = options?.height ?? 60;
     var margin = 5;
@@ -557,10 +559,8 @@ function histogram2D(id, xdata, ydata, options) {
     var bucketnum = options?.buckets ?? 25;
     var bucketwidth = Math.round(width / bucketnum);
 
-    var proportional = options?.proportional ?? true;
-
     var canvas = document.getElementById(id);
-    if (xdata.length == 0 || xdata.length != ydata.length) { return canvas.remove(); } // Early exit
+    if (xdata.length == 0 || (ydata && xdata.length != ydata.length)) { return canvas.remove(); } // Early exit
 
     canvas.setAttribute("width", margin + width + margin + "px");
     canvas.setAttribute("height", labels + margin + height + ticks + margin + labels + "px");
@@ -579,82 +579,9 @@ function histogram2D(id, xdata, ydata, options) {
     buckets.fill(0);
     for (var i = 0; i < xdata.length; i++) {
         var j = Math.floor(xdata[i] / xma * buckets.length);
-        var x = proportional ? xdata[i] : 1;
-        buckets[Math.min(j, buckets.length-1)] += ydata[i];
-        sum += ydata[i];
-    }
-    var yma = Math.max.apply(null, buckets);
-    
-    ctx.fillStyle = "rgba(0, 0, 0, .2)";
-    for (var i = 0; i < buckets.length; i++) {
-        ctx.fillRect(margin + i/buckets.length*width, labels + margin + height, width/buckets.length, -height*buckets[i]/yma);
-    }
-
-    ctx.fillStyle = "black";
-    ctx.textBaseline = "bottom";
-    ctx.textAlign = "center";
-    for (var i = 0; i < buckets.length; i++) {
-        if (buckets[i] == 0) continue;
-        ctx.fillText(Math.round(buckets[i] / sum * 100) + "%", margin + (i + .5)/buckets.length * width, labels + height*(1 - buckets[i]/yma));
-    }
-    
-    ctx.textBaseline = "top";
-    var base = Math.round(Math.log10(xma)) - 1
-    var step = Math.pow(10, base);
-
-    var factor;
-    if (xma / step > 20) factor = +1;
-    else if (xma / step < 10) factor = -1;
-    else factor = 0;
-
-    step *= Math.pow(2, factor);
-
-    for (var i = 0; i < 10 * Math.sqrt(10); i++) {
-        var pos = i * step;
-        if (pos > xma) break;
-        ctx.beginPath();
-        ctx.moveTo(pos / xma * width + margin, labels + margin + height);
-        ctx.lineTo(pos / xma * width + margin, labels + margin + height + ticks);
-        var label = makelabel(i, base, factor);
-        ctx.fillText(label, pos / xma * width + margin, labels + margin + height + ticks + margin);
-        ctx.stroke();
-    }
-}
-
-function histogram(id, data, options) {
-    var width = options?.width ?? 676;
-    var height = options?.height ?? 60;
-    var margin = 5;
-    var labels = 10;
-    var ticks = 5;
-    var bucketnum = options?.buckets ?? 25;
-    var bucketwidth = Math.round(width / bucketnum);
-
-    var proportional = options?.proportional ?? true;
-
-    var canvas = document.getElementById(id);
-    if (data.length == 0) { return canvas.remove(); } // Early exit
-
-    canvas.setAttribute("width", margin + width + margin + "px");
-    canvas.setAttribute("height", labels + margin + height + ticks + margin + labels + "px");
-    var ctx = canvas.getContext("2d");
-      
-    ctx.beginPath();
-    ctx.strokeStyle = "black";
-    ctx.moveTo(margin, labels + margin + height);
-    ctx.lineTo(margin + width, labels + margin + height);
-    ctx.stroke();
-    
-    var xma = options?.max ?? Math.max.apply(null, data);
-      
-    var buckets = Array(bucketnum);
-    var sum = 0;
-    buckets.fill(0);
-    for (var i = 0; i < data.length; i++) {
-        var j = Math.floor(data[i] / xma * buckets.length);
-        var x = proportional ? data[i] : 1;
-        buckets[Math.min(j, buckets.length-1)] += x;
-        sum += x;
+        var weight = ydata ? ydata[i] : xdata[i];
+        buckets[Math.min(j, buckets.length-1)] += weight;
+        sum += weight;
     }
     var yma = Math.max.apply(null, buckets);
     

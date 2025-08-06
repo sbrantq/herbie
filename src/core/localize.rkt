@@ -2,33 +2,36 @@
 
 (require math/bigfloat
          racket/hash)
-(require "../syntax/sugar.rkt"
+(require "../utils/common.rkt"
+         "../utils/float.rkt"
+         "../syntax/sugar.rkt"
          "../syntax/syntax.rkt"
          "../syntax/types.rkt"
-         "rules.rkt"
-         "../utils/common.rkt"
-         "../utils/float.rkt"
          "../syntax/platform.rkt"
-         "../syntax/read.rkt"
-         "../syntax/read.rkt"
-         "../core/rival.rkt"
+         "batch.rkt"
+         "compiler.rkt"
          "points.rkt"
          "programs.rkt"
-         "sampling.rkt"
-         "simplify.rkt"
-         "egg-herbie.rkt"
-         "compiler.rkt"
-         "batch.rkt")
+         "rival.rkt")
 
 (module+ test
   (require rackunit
-           "../syntax/load-plugin.rkt"
            "../syntax/syntax.rkt"
-           "../syntax/sugar.rkt")
-  (load-herbie-builtins))
+           "../syntax/sugar.rkt"))
 
 (provide compute-local-errors
+         eval-progs-real
          local-error-as-tree)
+
+(define (eval-progs-real specs ctxs)
+  (define compiler (make-real-compiler specs ctxs))
+  (define bad-pt
+    (for/list ([ctx* (in-list ctxs)])
+      ((representation-bf->repr (context-repr ctx*)) +nan.bf)))
+  (define (<eval-prog-real> pt)
+    (define-values (_ exs) (real-apply compiler pt))
+    (or exs bad-pt))
+  <eval-prog-real>)
 
 ;; The local error of an expression f(x, y) is
 ;;
@@ -43,7 +46,7 @@
 (define (local-error exact node repr get-exact)
   (match node
     [(? literal?) 1]
-    [(? variable?) 1]
+    [(? symbol?) 1]
     [(approx _ impl) (ulp-difference exact (get-exact impl) repr)]
     [`(if ,c ,ift ,iff) 1]
     [(list f args ...)
@@ -54,10 +57,10 @@
 (define (make-matrix roots pcontext)
   (for/vector #:length (vector-length roots)
               ([node (in-vector roots)])
-    (make-vector (pcontext-length (*pcontext*)))))
+    (make-vector (pcontext-length pcontext))))
 
 ; Compute local error or each sampled point at each node in `prog`.
-(define (compute-local-errors subexprss ctx)
+(define (compute-local-errors subexprss ctx pcontext)
   (define exprs-list (append* subexprss)) ; unroll subexprss
   (define reprs-list (map (curryr repr-of ctx) exprs-list))
   (define ctx-list
@@ -66,16 +69,15 @@
       (struct-copy context ctx [repr repr])))
 
   (define expr-batch (progs->batch exprs-list))
-  (define nodes (batch-nodes expr-batch))
   (define roots (batch-roots expr-batch))
 
   (define subexprs-fn (eval-progs-real (map prog->spec exprs-list) ctx-list))
 
-  (define errs (make-matrix roots (*pcontext*)))
+  (define errs (make-matrix roots pcontext))
 
-  (for ([(pt ex) (in-pcontext (*pcontext*))]
+  (for ([(pt ex) (in-pcontext pcontext)]
         [pt-idx (in-naturals)])
-    (define exacts (list->vector (apply subexprs-fn pt)))
+    (define exacts (list->vector (subexprs-fn pt)))
     (define (get-exact idx)
       (vector-ref exacts (vector-member idx roots)))
     (for ([expr (in-list exprs-list)]
@@ -83,7 +85,7 @@
           [repr (in-list reprs-list)]
           [exact (in-vector exacts)]
           [expr-idx (in-naturals)])
-      (define err (local-error exact (vector-ref nodes root) repr get-exact))
+      (define err (local-error exact (batch-ref expr-batch root) repr get-exact))
       (vector-set! (vector-ref errs expr-idx) pt-idx err)))
 
   (define n 0)
@@ -98,15 +100,15 @@
 ;; since those aren't real numbers. To fix this, we replace all
 ;; non-finite R[e] with 0.
 (define (remove-infinities pt reprs)
-  (for/list ([val (in-vector pt)]
-             [repr (in-list reprs)])
+  (for/vector ([val (in-vector pt)]
+               [repr (in-list reprs)])
     (define bf-val ((representation-repr->bf repr) val))
     (if (implies (bigfloat? bf-val) (bfrational? bf-val))
         val
         ((representation-bf->repr repr) 0.bf))))
 
 ;; Compute local error or each sampled point at each node in `prog`.
-(define (compute-errors subexprss ctx)
+(define (compute-errors subexprss ctx pcontext)
   ;; We compute the actual (float) result
   (define exprs-list (append* subexprss)) ; unroll subexprss
   (define actual-value-fn (compile-progs exprs-list ctx))
@@ -139,26 +141,25 @@
   (define delta-fn (eval-progs-real compare-specs (map (const delta-ctx) compare-specs)))
 
   (define expr-batch (progs->batch exprs-list))
-  (define nodes (batch-nodes expr-batch))
   (define roots (batch-roots expr-batch))
 
-  (define ulp-errs (make-matrix roots (*pcontext*)))
-  (define exacts-out (make-matrix roots (*pcontext*)))
-  (define approx-out (make-matrix roots (*pcontext*)))
-  (define true-error-out (make-matrix roots (*pcontext*)))
+  (define ulp-errs (make-matrix roots pcontext))
+  (define exacts-out (make-matrix roots pcontext))
+  (define approx-out (make-matrix roots pcontext))
+  (define true-error-out (make-matrix roots pcontext))
 
   (define spec-vec (list->vector spec-list))
   (define ctx-vec (list->vector ctx-list))
-  (for ([(pt ex) (in-pcontext (*pcontext*))]
+  (for ([(pt ex) (in-pcontext pcontext)]
         [pt-idx (in-naturals)])
 
-    (define exacts (list->vector (apply subexprs-fn pt)))
+    (define exacts (list->vector (subexprs-fn pt)))
     (define (get-exact idx)
       (vector-ref exacts (vector-member idx roots)))
 
-    (define actuals (apply actual-value-fn pt))
-    (define pt* (append pt (remove-infinities actuals reprs-list)))
-    (define deltas (list->vector (apply delta-fn pt*)))
+    (define actuals (actual-value-fn pt))
+    (define pt* (vector-append pt (remove-infinities actuals reprs-list)))
+    (define deltas (list->vector (delta-fn pt*)))
 
     (for ([repr (in-list reprs-list)]
           [root (in-vector roots)]
@@ -166,7 +167,7 @@
           [actual (in-vector actuals)]
           [delta (in-vector deltas)]
           [expr-idx (in-naturals)])
-      (define ulp-err (local-error exact (vector-ref nodes root) repr get-exact))
+      (define ulp-err (local-error exact (batch-ref expr-batch root) repr get-exact))
       (vector-set! (vector-ref exacts-out expr-idx) pt-idx exact)
       (vector-set! (vector-ref approx-out expr-idx) pt-idx actual)
       (vector-set! (vector-ref ulp-errs expr-idx) pt-idx ulp-err)
@@ -191,7 +192,7 @@
     [(list '! props ... (list op args ...)) op]
     [(list op args ...) op]
     [(? number? c) (exact->inexact c)]
-    [(? variable? c) c]))
+    [(? symbol? c) c]))
 
 (define (expr->json-tree expr ctx decorate)
   (define (make-json-tree subexpr)
@@ -207,8 +208,8 @@
 ;; Compute the local error of every subexpression of `prog`
 ;; and returns the error information as an S-expr in the
 ;; same shape as `prog`
-(define (local-error-as-tree expr ctx)
-  (define data-hash (first (compute-errors (list (all-subexpressions expr)) ctx)))
+(define (local-error-as-tree expr ctx pcontext)
+  (define data-hash (first (compute-errors (list (all-subexpressions expr)) ctx pcontext)))
 
   (define (translate-booleans value)
     (match value

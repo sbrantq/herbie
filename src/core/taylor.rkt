@@ -1,8 +1,8 @@
 #lang racket
 
 (require math/number-theory)
-(require "../syntax/syntax.rkt"
-         "../utils/common.rkt"
+(require "../utils/common.rkt"
+         "../syntax/syntax.rkt"
          "batch.rkt"
          "programs.rkt"
          "reduce.rkt")
@@ -84,10 +84,9 @@
   (check-equal? '(cbrt x) (test-expand-taylor '(pow x 1/3)))
   (check-equal? '(cbrt (* x x)) (test-expand-taylor '(pow x 2/3)))
   (check-equal? '(+ 100 (cbrt x)) (test-expand-taylor '(+ 100 (pow x 1/3))))
-  (check-equal? `(+ 100 (cbrt (* x ,(approx 2 3))))
-                (test-expand-taylor `(+ 100 (pow (* x ,(approx 2 3)) 1/3))))
-  (check-equal? `(+ ,(approx 2 3) (cbrt x)) (test-expand-taylor `(+ ,(approx 2 3) (pow x 1/3))))
-  (check-equal? `(+ (cbrt x) ,(approx 2 1/3)) (test-expand-taylor `(+ (pow x 1/3) ,(approx 2 1/3)))))
+  (check-equal? `(+ 100 (cbrt (* x y))) (test-expand-taylor `(+ 100 (pow (* x y) 1/3))))
+  (check-equal? `(+ y (cbrt x)) (test-expand-taylor `(+ y (pow x 1/3))))
+  (check-equal? `(+ (cbrt x) y) (test-expand-taylor `(+ (pow x 1/3) y))))
 
 (define (make-horner var terms [start 0])
   (match terms
@@ -114,8 +113,6 @@
 
 (define/reset log-cache (make-hash '((1 . ((1 -1 1))))))
 
-(define/reset series-cache (make-hash))
-
 (define (n-sum-to n k)
   (hash-ref! (n-sum-to-cache)
              (cons n k)
@@ -131,49 +128,48 @@
 
 (define (taylor var expr-batch)
   "Return a pair (e, n), such that expr ~= e var^n"
-  (define nodes (batch-nodes expr-batch))
   (define taylor-approxs (make-vector (batch-length expr-batch))) ; vector of approximations
 
-  (for ([node (in-vector nodes)]
+  (for ([node (in-batch expr-batch)]
         [n (in-naturals)])
     (define approx
       (match node
         [(? (curry equal? var)) (taylor-exact 0 1)]
         [(? number?) (taylor-exact node)]
-        [(? variable?) (taylor-exact node)]
+        [(? symbol?) (taylor-exact node)]
         [`(,const) (taylor-exact node)]
         [`(+ ,args ...) (apply taylor-add (map (curry vector-ref taylor-approxs) args))]
         [`(neg ,arg) (taylor-negate ((curry vector-ref taylor-approxs) arg))]
         [`(* ,left ,right)
          (taylor-mult (vector-ref taylor-approxs left) (vector-ref taylor-approxs right))]
         [`(/ ,num ,den)
-         #:when (equal? (vector-ref nodes num) 1)
+         #:when (equal? (batch-ref expr-batch num) 1)
          (taylor-invert (vector-ref taylor-approxs den))]
         [`(/ ,num ,den)
          (taylor-quotient (vector-ref taylor-approxs num) (vector-ref taylor-approxs den))]
         [`(sqrt ,arg) (taylor-sqrt var (vector-ref taylor-approxs arg))]
         [`(cbrt ,arg) (taylor-cbrt var (vector-ref taylor-approxs arg))]
         [`(exp ,arg)
-         (let ([arg* (normalize-series (vector-ref taylor-approxs arg))])
-           (if (positive? (car arg*))
-               (taylor-exact (batch-ref expr-batch n))
-               (taylor-exp (zero-series arg*))))]
+         (define arg* (normalize-series (vector-ref taylor-approxs arg)))
+         (if (positive? (car arg*))
+             (taylor-exact (batch-pull expr-batch n))
+             (taylor-exp (zero-series arg*)))]
         [`(sin ,arg)
-         (let ([arg* (normalize-series (vector-ref taylor-approxs arg))])
-           (cond
-             [(positive? (car arg*)) (taylor-exact (batch-ref expr-batch n))]
-             [(= (car arg*) 0)
-              ; Our taylor-sin function assumes that a0 is 0,
-              ; because that way it is especially simple. We correct for this here
-              ; We use the identity sin (x + y) = sin x cos y + cos x sin y
-              (taylor-add
-               (taylor-mult (taylor-exact `(sin ,((cdr arg*) 0))) (taylor-cos (zero-series arg*)))
-               (taylor-mult (taylor-exact `(cos ,((cdr arg*) 0))) (taylor-sin (zero-series arg*))))]
-             [else (taylor-sin (zero-series arg*))]))]
+         (define arg* (normalize-series (vector-ref taylor-approxs arg)))
+         (cond
+           [(positive? (car arg*)) (taylor-exact (batch-pull expr-batch n))]
+           [(= (car arg*) 0)
+            ; Our taylor-sin function assumes that a0 is 0,
+            ; because that way it is especially simple. We correct for this here
+            ; We use the identity sin (x + y) = sin x cos y + cos x sin y
+            (taylor-add
+             (taylor-mult (taylor-exact `(sin ,((cdr arg*) 0))) (taylor-cos (zero-series arg*)))
+             (taylor-mult (taylor-exact `(cos ,((cdr arg*) 0))) (taylor-sin (zero-series arg*))))]
+           [else (taylor-sin (zero-series arg*))])]
         [`(cos ,arg)
          (define arg* (normalize-series (vector-ref taylor-approxs arg)))
          (cond
-           [(positive? (car arg*)) (taylor-exact (batch-ref expr-batch n))]
+           [(positive? (car arg*)) (taylor-exact (batch-pull expr-batch n))]
            [(= (car arg*) 0)
             ; Our taylor-cos function assumes that a0 is 0,
             ; because that way it is especially simple. We correct for this here
@@ -185,9 +181,10 @@
            [else (taylor-cos (zero-series arg*))])]
         [`(log ,arg) (taylor-log var (vector-ref taylor-approxs arg))]
         [`(pow ,base ,power)
-         #:when (exact-integer? (vector-ref nodes power))
-         (taylor-pow (normalize-series (vector-ref taylor-approxs base)) (vector-ref nodes power))]
-        [_ (taylor-exact (batch-ref expr-batch n))]))
+         #:when (exact-integer? (batch-ref expr-batch power))
+         (taylor-pow (normalize-series (vector-ref taylor-approxs base))
+                     (batch-ref expr-batch power))]
+        [_ (taylor-exact (batch-pull expr-batch n))]))
     (vector-set! taylor-approxs n approx))
   taylor-approxs)
 
@@ -216,12 +213,12 @@
     [else
      (define offset* (car (argmax car serieses)))
      (for/list ([series serieses])
-       (let ([offset (car series)])
-         (cons offset*
-               (λ (n)
-                 (if (< (+ n (- offset offset*)) 0)
-                     0
-                     ((cdr series) (+ n (- offset offset*))))))))]))
+       (define offset (car series))
+       (cons offset*
+             (λ (n)
+               (if (negative? (+ n (- offset offset*)))
+                   0
+                   ((cdr series) (+ n (- offset offset*)))))))]))
 
 (define (taylor-add . terms)
   (match-define `((,offset . ,serieses) ...) (apply align-series terms))
@@ -251,7 +248,8 @@
   "Fixes up the series to have a non-zero zeroth term,
    allowing a possibly negative offset"
   (match-define (cons offset coeffs) series)
-  (let ([slack (first-nonzero-exp coeffs)]) (cons (- offset slack) (compose coeffs (curry + slack)))))
+  (define slack (first-nonzero-exp coeffs))
+  (cons (- offset slack) (compose coeffs (curry + slack))))
 
 (define ((zero-series series) n)
   (if (< n (- (car series)))
@@ -455,14 +453,13 @@
 (define (loggenerate table)
   (apply append
          (for/list ([term table])
-           (match term
-             [`(,coeff ,ps ...)
-              (filter identity
-                      (for/list ([i (in-naturals)]
-                                 [p ps])
-                        (if (zero? p)
-                            #f
-                            `(,(* coeff p) ,@(list-setinc ps i)))))]))))
+           (match-define `(,coeff ,ps ...) term)
+           (filter identity
+                   (for/list ([i (in-naturals)]
+                              [p ps])
+                     (if (zero? p)
+                         #f
+                         `(,(* coeff p) ,@(list-setinc ps i))))))))
 
 (define (lognormalize table)
   (filter (λ (entry) (not (= (car entry) 0)))
@@ -478,35 +475,37 @@
 (define (taylor-log var arg)
   (match-define (cons shift coeffs) (normalize-series arg))
   (define hash (make-hash))
-  (hash-set! hash 0 (reduce `(log ,(coeffs 0))))
+  (define negate? (and (number? (coeffs 0)) (not (positive? (coeffs 0)))))
+  (define (maybe-negate x)
+    (if negate?
+        `(neg ,x)
+        x))
+  (hash-set! hash 0 (reduce `(log ,(maybe-negate (coeffs 0)))))
 
   (define (series n)
     (hash-ref! hash
                n
                (λ ()
-                 (let* ([tmpl (logcompute n)])
-                   (reduce `(/ (+ ,@(for/list ([term tmpl])
-                                      (match term
-                                        [`(,coeff ,k ,ps ...)
-                                         `(* ,coeff
-                                             (/ (* ,@(for/list ([i (in-naturals 1)]
-                                                                [p ps])
-                                                       (if (= p 0)
-                                                           1
-                                                           `(pow (* ,(factorial i) ,(coeffs i)) ,p))))
-                                                (pow ,(coeffs 0) ,(- k))))])))
-                               ,(factorial n)))))))
+                 (define tmpl (logcompute n))
+                 (reduce `(/ (+ ,@(for/list ([term tmpl])
+                                    (match-define `(,coeff ,k ,ps ...) term)
+                                    `(* ,coeff
+                                        (/ (* ,@(for/list ([i (in-naturals 1)]
+                                                           [p ps])
+                                                  (if (= p 0)
+                                                      1
+                                                      `(pow (* ,(factorial i) ,(coeffs i)) ,p))))
+                                           (exp (* ,(- k) ,(series 0)))))))
+                             ,(factorial n))))))
 
   (cons 0
         (λ (n)
           (if (and (= n 0) (not (zero? shift)))
-              (reduce `(+ (* (neg ,shift) (log ,var)) ,(series 0)))
+              (reduce `(+ (* (neg ,shift) (log ,(maybe-negate var))) ,(series 0)))
               (series n)))))
 
 (module+ test
-  (require rackunit
-           "../syntax/types.rkt"
-           "../syntax/load-plugin.rkt")
+  (require rackunit)
   (define batch (progs->batch (list '(pow x 1.0))))
   (set! batch (expand-taylor batch))
   (define root (vector-ref (batch-roots batch) 0))
@@ -524,4 +523,4 @@
   (check-equal? (coeffs '(cbrt (+ 1 x))) '(1 1/3 -1/9 5/81 -10/243 22/729 -154/6561))
   (check-equal? (coeffs '(sqrt x)) '((sqrt x) 0 0 0 0 0 0))
   (check-equal? (coeffs '(cbrt x)) '((cbrt x) 0 0 0 0 0 0))
-  (check-equal? (coeffs '(cbrt (* x x))) '((cbrt (pow x 2)) 0 0 0 0 0 0)))
+  (check-equal? (coeffs '(cbrt (* x x))) '((pow x 2/3) 0 0 0 0 0 0)))
